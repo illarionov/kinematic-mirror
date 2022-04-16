@@ -1,0 +1,107 @@
+Jun 23 2006
+ o When interpolating to common time, adjust clock drift by doppler.
+ o Filter is throwing too many satellites. ease up. Later, parameterize.
+ o Tries to find solution even when not enough satellites. Bad householder.
+
+Apr 23 2006
+ x Generate residual output
+ o static positioning is broken.
+ o Antaris is 1 second ahead of AC12 when acquiring data
+
+Mar 24 2006
+ x Outlier detection.  Add + drop satellites first. Don't log the trial drops.
+ x Suppress trailing blanks in headers to avoid problems with teqc
+ x New line when more than 12 satellites in Rinex file
+ x Debug and log files
+ x Test data for internal consistency (PR vs Phase)
+ o Garmin serial binary protocol
+ o >1 Hz updates
+ o The accuracy estimates are waay off, esp after losing phase lock
+
+Mar 17 2006
+ x Rinex output contains ### for one of the Waas satellites  (122?)\
+ x Add doppler and SNR measurements to rinex output
+ o Nav file output
+ x clock drift problem in Antaris
+ o (Process)Get ephemerides from best of sp3, base, rover.
+
+Mar 12 2006
+
+ x Rinex Position header "APROX --> APPROX"
+ x Rinex signal to noise ratio. 
+ x Doesn't recognize satellite 122. Stops suddenly.
+ x Need to display "Antaris" in rinex output file
+ x Position type for wgs84 comes out with xyz labels and precisions.
+ x comma separated position output, no spaces between date+time
+ x Rinex input needs to accept event records
+ x Rinex output displays sbas satellites
+ x Rinex, zero phase means "no phase"
+   (integrated doppler starts at zero, but that is a "no phase" state anyway.)
+ o same for processing - use pseudo-ranges even if phase not available. check prev phase
+ o Create "station" class with setup info
+ o Can we get Sbaas ephemerides from receivers?
+ o Accuracy estimates - depends on static/kinematic, affected by slips, ...
+ o back substitution for postprocessing
+ o "event log" for processing (output to separate stream from position info)
+ o processing parameters - filter out weak satelites, gain/loss, slips, ...
+ o dgps station
+
+Feb 27
+
+ x Fill in the Rinex fields with receiver type
+ x Create a postprocessor with NewReceiver(model,port), -codeonly, -static
+ o Fix up garmin so it uses Rs232 stream, simulated by usb. 
+ o See if garmin driver bug fixed so main can write while thread reads
+ o Better accuracy estimates in postprocessor
+ x error handling stack, ClearError(), PrintError()
+ o set signal level in antaris
+ o include signal level in rinex file (or is that rinex 3.0?)
+ x Figure out baud rate issues - existing rate, receiver default, search
+   and don't record the bytes while doing it.
+ x Fix the various receivers.
+ x Add "level" to debug routines so we don't have to recompile to change output
+
+For later
+ o DGPS reference station 
+ o backsubstitution for postprocessing
+ o config file with all Rinex and rtcm info
+ o event file for starting/stopping movement of rover
+ o multiple base station antennas
+ o integer ambiguity, Kalman filter
+
+
+October 6
+
+Snapshot #2 (done)
+x Use normal satellite numbering rather than starting at 1.  Less confusion.
+x Define a simulator for debug purposes. 
+x Package as a utility to read two Rinex files and an SP3 file.
+x Drop a satellite if encountering outliers.
+
+Snapshot #3
+x Create a generic raw routine to align data to epoch boundary.
+  Probably take weeknr+tow and convert to Time.
+o Redefine RawReceiver, with just the valid satellites, and use "svid" not "sat".
+o Change raw format to contain just the valid observations.
+x Separate acquisition from processing, using RTCM 104 to communicate
+x Acquisition utility - various GPS receivers and Rinex to RTCM 104
+x Converters from Block to Be and Le
+o Use BE and LE to parse Garmin records
+
+Post Snapshot #3
+o Maintainable design documentation
+o User instructions
+o Test plan
+
+Longer term
+o Error handling
+o User interface
+o post processing, back substitution to solve for previous positions
+o Explore standard data archive data formats, including events.
+o Save the data needed to backsubstitute positions all the way back to the beginning.
+o User interface, both for postprocessing and acquisition.
+
+Really Long term
+o integer ambiguity
+o realtime communications
+o navigation sensors

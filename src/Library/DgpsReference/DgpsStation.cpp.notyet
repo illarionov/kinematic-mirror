@@ -1,0 +1,232 @@
+#include "DgpsStation.h"
+
+
+
+DgpsObservation::DgpsObservation()
+{
+}
+
+
+DgpsObservation::~DgpsObservation()
+{
+}
+
+
+
+DgpsHistory::DgpsHistory()
+{
+	count = 0;
+	for (int i=0; i<MaxHist; i++)
+		for (int s=0; s<MaxSats; s++)
+			obs[i].PR[s] = 0;
+}
+
+DgpsHistory::~DgpsHistory()
+{
+}
+
+
+bool DgpsHistory::AddEpoch(RawReceiver& gps)
+{
+	// Allocate a new spot in the Dgps history, wrapping around on overflow
+    DgpsObservation& o = obs[count++];
+	if (count >= MaxHist) count = 0;
+
+	// Copy the GPS pseudoranges into the Dgps history
+	o.time = gps.GpsTime;
+	for (int s=0; s<MaxSats; s++)
+		if (gps.obs[s].Valid)
+			o.PR[s] = gps.obs[s].PR;
+		else 
+			o.PR[s] = 0;
+
+	return OK;
+}
+
+
+
+DgpsCorrector::DgpsCorrector(Position& pos)
+:Pos(pos)
+{
+}
+
+bool DgpsCorrector::AddEpoch(RawReceiver& gps)
+{
+	// Add the current measurements to the history
+	if (Hist.AddEpoch(gps) != OK) return Error();
+
+	return OK;
+}
+
+
+
+bool DgpsCorrector::GetCorrections(Time now, Ephemerides& eph, 
+					double range[MaxSats], double rate[MaxSats])
+{
+	// Select the satellites we want to use;
+	bool Selected[MaxSats];
+	if (SelectSatellites(Selected) != OK)  return Error();
+
+	// solve the corrections
+	if (SolveCorrections(Selected, now, eph, range, rate) != OK) return Error();
+
+	return OK;
+}
+
+bool DgpsCorrector::SelectSatellites(bool Selected[MaxSats])
+{
+	debug("DgpsCorrector::SelectSatellites\n");
+    // Do for each satellite
+	for (int s=0; s<MaxSats; s++) {
+
+		// Count how many epochs included this satellite
+		int SatCnt = 0;
+		for (int i=0; i<Hist.count; i++)
+			if (Hist.obs[i].PR[s] != 0)
+				SatCnt++;
+
+		// Select the satellite if 30 epochs (out of 90?)
+		Selected[s] = SatCnt >= 30;
+		if (Selected[s]) debug("   Selected %d\n", s);
+	}
+
+	return OK;
+}
+
+bool DgpsCorrector::SolveCorrections(bool Selected[MaxSats], Time now, Ephemerides& eph,
+									 double range[MaxSats], double rate[MaxSats])
+{
+	debug("DgpsCorrector::SolveCorrections \n");
+
+	// Create the equations from all the epochs
+	DgpsEquations eqn(Selected, Pos, eph);
+	for (int i=0; i<Hist.MaxHist; i++) 
+		eqn.AddEpoch(Hist.obs[i]);
+
+	return eqn.SolveCorrections(range, rate);
+}
+
+
+DgpsCorrector::~DgpsCorrector()
+{
+}
+
+
+DgpsStation::DgpsStation(Stream& out, RawReceiver& g)
+: rtcm(out), gps(g), dgps(g.Pos)
+{
+	ErrCode = rtcm.GetError() || gps.GetError();
+	NextTime = gps.GpsTime + 30;
+}
+
+bool DgpsStation::OutputEpoch()
+{
+	// (LATER) deal with ephemeris change.
+
+	// Add the current epoch to the corrections
+	dgps.AddEpoch(gps);
+
+	// if it isn't time yet, then done
+	if (gps.GpsTime < NextTime) return OK;
+
+	// Get the corrections 
+	double range[MaxSats], rate[MaxSats];
+	if (dgps.GetCorrections(gps.GpsTime, gps, range, rate) != OK) return Error();
+
+	// Output the rtcm corrections
+
+
+	return OK;
+}
+
+
+DgpsStation::~DgpsStation()
+{
+}
+
+
+
+DgpsEquations::DgpsEquations(bool selected[MaxSats], Position& p, Ephemerides& e)
+: Pos(p), eph(e)
+{
+	// Do for each selected satellite
+	for (int s=0; s<MaxSats; s++) {
+		if (!selected[s]) continue;
+
+		// Reserve two columns for the satellite's range and rate unknowns
+		ColumnToSatellite[N++] = s;
+		ColumnToSatellite[N++] = s;
+	}
+
+	// We have no rows yet
+	M = 0;
+}
+
+
+
+bool DgpsEquations::AddEpoch(DgpsObservation& o)
+{
+	// Do for each selected satellite
+	int m = 0; double SumB = 0; double b[MaxChannels];
+	for (int c=0; c<N; c+=2) {
+		int s = ColumnToSatellite[c];
+
+		// Get the Satellite information
+		Position SatPos; double ClockAdjust;
+
+		// Calculate the "adjusted" pseudorange (but don't add in receiver clock yet)
+		double adjusted = o.PR[s] + ClockAdjust*C;
+		double actual = Range(SatPos - Pos);
+
+		// Build the equation  -  x1(s) + t*x2(s) + rcvrclock = (adjusted-actual)
+		//   we only compute B right now. t is constant for the epoch, and the others are "1"
+		b[m] = adjusted - actual;
+
+		// Do some bookkeeping for the next step
+		SumB += b[m];
+		m++;
+	}
+
+	// Make sure we have enough satellites in this epoch
+	if (m < 4) return OK;
+
+	// Do a Householder transfrom to eliminate rcvrclock.
+	//  This is a special form which maps (1,1,1..1) onto (c,0,0..0)
+	//  It takes the form of adjustments to each of the columns.
+
+	// Do for each row for this epoch, except the last (which is being eliminated)
+	for (int i=0; i<m-1; i++) {
+
+	    // Allocate a new row in the matrix
+	    if (M >= MaxM-1) return Error("DgpsEquations -- matrix overflowed\n");
+	    int row = M++;
+
+		// Fill in each column of the row, two columns per satellite j
+		for (int j=0; j<m-1; j++) 
+			if (i == j) {
+		        Array[row][2*j] = (1-RootM);
+		        Array[row][2*j+1] = t*(1-RootM);
+			} else {
+				Array[row][2*j] = -RootM;
+				Array[row][2*j+1] = t * -RootM;
+			}
+
+        // Adjust the B as well
+        B[row] = b[i] - bAdjust;
+	}
+	
+
+	return OK;
+}
+
+
+bool DgpsEquations::SolveCorrections(double range[MaxSats], double rate[MaxSats])
+{
+	return OK;
+}
+
+
+DgpsEquations::~DgpsEquations()
+{
+}
+

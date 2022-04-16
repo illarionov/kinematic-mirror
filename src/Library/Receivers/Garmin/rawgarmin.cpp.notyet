@@ -1,0 +1,224 @@
+
+// RawGarmin reads GPS raw data from a Garmin GPS18 receiver
+//    Part of Kinematic, a utility for GPS positioning
+//
+// Copyright (C) 2006  John Morris    kinematic@precision-gps.org
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation, version 2.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+// Note: we use an undocumented command to download Navigation messages
+//
+// The undocumented messages are enabled with the "async" command
+//      0x??, bitmask16
+//
+//  0x0002 -- messsage 0xd
+//
+// There were problems with Garmin's USB driver, so some of the initialization
+//   protocol was moved to the communication layer (CommGarminUsb). I also created
+//   a separate "reading" thread to ensure we don't lose data.
+//
+// TODO: use the block unpacker to extract the data values from garmin records.
+//       (the current use of packed records is not portable)
+
+
+#include "RawGarmin.h"
+#include "util.h"
+
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+
+RawGarmin::RawGarmin(Comm& c):comm(c)
+{
+	ErrCode = Initialize();
+	debug("RawGarmin: ErrCode=%d\n", ErrCode);
+}
+
+bool RawGarmin::Initialize()
+{
+	strcpy(Description, "GarminGps18");
+
+	debug("RawGarmin::Initialize - comm.Geterror=%d\n", comm.GetError());
+	if (comm.GetError())
+		return Error();
+
+	// We rely on CommGarmin to put the unit into binary mode
+	//   with the proper messages. There were lost messages
+	//   when one thread wrote to the unit while another was
+	//   reading. 
+
+	// Use the broadcast ephemeris
+	for (int32 s=0; s<MaxSats; s++)
+		eph[s] = new EphemerisXmit(s, "Garmin USB18");
+
+	return OK;
+}
+
+RawGarmin::~RawGarmin()
+{
+}
+
+bool RawGarmin::NextEpoch()
+{
+	// Reset the times. They will indicate we are tracking satellites
+	PositionTime = -1;  GpsTime = -2;
+	
+	// Repeat until we get consistent position and measurement records
+	while (PositionTime != GpsTime) { 
+		
+		// Read a garmin binary message
+		Block b;
+		if (comm.GetBlock(b))  return Error();
+
+		if      (b.Id == PidReceiverMeasurement) ProcessReceiverMeasurement(b);
+		else if (b.Id == PidPositionRecord)      ProcessPositionRecord(b);
+		else if (b.Id == PidNavigationData)      ProcessNavigationData(b);
+		else                                     debug("Garmin received msg %d\n",b.Id);
+	}
+	
+	debug("RawGarmin::NextEpoch  GpsTime=%.9f  PositionTime=%.9f \n", 
+		S(GpsTime),S(PositionTime));
+			
+	return OK;
+}
+
+
+////////////////////////////////////////////////////////////////////////
+//
+// Private Stuff
+//
+/////////////////////////////////////////////////////////////////////////
+
+
+
+bool RawGarmin::ProcessPositionRecord(Block &b)
+{
+	PositionRecord& p = (PositionRecord&) b.Data;
+
+	// We must be getting reasonable fixes before processing
+	if (p.fix != 3)  // Not sure if this is correct. VERIFY!
+		return OK;
+
+	Pos = Wgs84ToPosition(lla(RadToDeg(p.lat), RadToDeg(p.lon), p.alt));
+	PositionTime = NearestSecond(ConvertGarminTime(p.grmn_days, p.gps_tow));
+	debug("RawGarmin::Position  GpsTow=%.0f  Tow=%.0f\n", 
+		p.gps_tow, GpsTow(GpsTime));
+	debug("RawGarmin::Position GpsTime=%.0f  Pos=(%.3f %.3f %.3f)\n",
+	    S(GpsTime), Pos.x, Pos.y, Pos.z);
+	return OK;
+}
+
+
+bool RawGarmin::ProcessProductData(Block& b)
+{
+	ProductData& p = (ProductData&) b.Data;
+	copy(p.Description, Description);
+	debug("ProcessProductData: Description=%s\n", Description);
+	return OK;
+}
+
+bool RawGarmin::ProcessProtocolArray(Block& b)
+{
+	ProtocolArray& p = (ProtocolArray&)b.Data;
+	int count = b.Length / sizeof(p[0]);
+	for (int i = 0; i<count; i++)
+		debug("Protocol: %c%03d\n", p[i].Tag, p[i].Value);
+
+	return OK;
+}
+
+bool RawGarmin::ProcessReceiverMeasurement(Block& b)
+{
+
+	// Get rid of any previous satellite data
+	for (int s=0; s<MaxSats; s++)
+		obs[s].Valid = false;
+
+	ReceiverMeasurement& p = (ReceiverMeasurement&)b.Data;
+
+	MeasurementTime = ConvertGpsTime(p.rcvr_wn, p.rcvr_tow);
+
+	debug("Process Garmin measurements. Tow=%.3f time=%.3f\n", 
+		p.rcvr_tow, S(ConvertGpsTime(p.rcvr_wn, p.rcvr_tow)));
+
+	// do for each satellite being tracked
+	for (int i=0; i<12; i++) {
+		if (!p.Sat[i].valid) continue;
+
+		// Get the satellite index
+		int svid = p.Sat[i].svid + 1;
+		int Sat = SvidToSat(svid);
+
+		// Get the raw range and phase
+		obs[Sat].PR = p.Sat[i].pr;
+		obs[Sat].Phase = -(p.Sat[i].cycles + p.Sat[i].phase/2048.0);
+		obs[Sat].Slip = (p.Sat[i].slp_dtct != 0);
+		obs[Sat].SNR = p.Sat[i].snr_dbhz;
+		obs[Sat].Doppler = 0;  // Doesn't provide doppler data
+		obs[Sat].Valid = true;
+
+		debug("Garmin measurement: Sat=%d PR=%.3f Phase=%.3f Slip=%d\n",
+			Sat, obs[Sat].PR, obs[Sat].Phase, obs[Sat].Slip);
+	}
+
+	// Normalize the raw measurements and set the GPS time
+	MeasurementTime = AdjustToHz(MeasurementTime, p.rcvr_tow);
+
+	return OK;
+}
+
+
+
+
+bool RawGarmin::ProcessNavigationData(Block& blk)
+{
+	// This undocumented record contains the following fields
+	//   uint32 GPS bits since beginning of week
+	//   uint32 complement of NAV word.
+	//      Note: The HOW parity bits are always zero,
+	//      but garmin sets them to one. The data and
+	//      parity tests work out identically whether complemented 
+	//      or not. Thus, it appears Garmin gives us the complement.
+	//   uint8  PRN  (svid-1)
+	// Extract the field
+	LittleEndian b(blk);
+	uint32 BitNr = b.Get4(); 
+	NavWord Word = ~b.Get4(); 
+	uint8 svid = b.Get() + 1; 
+
+	// Get the satellite index 
+	int32 s = SvidToSat(svid); 
+
+	// Add a word to the Nav Frame
+	// Note: Garmin numbers the first word as bit 30, our code as bit 1.
+	debug("RawGarmin: Navword  s=%d  w=0x%08x  BitNr=%d\n", s, Word, (BitNr-29)%1500);
+	Frame[s].AddWord(Word, BitNr-29);
+
+	// if the frame is complete, then update the ephemeris
+	if (Frame[s].Complete()) {
+		EphemerisXmit& e = *dynamic_cast<EphemerisXmit*>(eph[s]);
+		e.AddFrame(Frame[s]);
+	}
+
+	return OK;
+}
+
+bool RawGarmin::PutCommand(int16 command)
+{
+	Block b(PidCommandData);
+	LittleEndian le(b);
+	le.Put2(command);
+	return comm.PutBlock(b);
+}
+

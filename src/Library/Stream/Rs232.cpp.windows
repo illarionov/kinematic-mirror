@@ -1,0 +1,329 @@
+
+//    Part of kinematic, a collection of utilities for GPS positioning
+//
+// Copyright (C) 2005  John Morris    kinematic@precision-gps.org
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation, version 2.
+
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+#include "Rs232.h"
+
+
+
+
+
+Rs232::Rs232(const char* name)
+{
+	ErrCode = Open(name);
+	if (ErrCode != OK)
+		Close();
+}
+
+Rs232::~Rs232(void)
+{
+	  Close();
+}
+
+
+bool Rs232::Open(const char* name)
+{
+	bool status = OK;
+		
+	// open the RS-232 port
+	Handle = CreateFile(name,
+		               GENERIC_READ | GENERIC_WRITE,
+					   0,
+					   0,
+					   OPEN_EXISTING,
+					   0,
+					   0);
+	if (Handle == INVALID_HANDLE_VALUE)
+		return SysError("Unable to open COM port %s\n", name);
+
+	// Enable buffering
+	if (!SetupComm(Handle, 4192, 4192))
+		status = SysError("Unable to enable buffering\n");
+	
+	// Find out the current baud rate
+	int baud;
+	if (GetBaud(baud) != OK) return Error();
+	
+	// Configure the port without changing baud rate
+	DCB dcb[1];
+	FillMemory(dcb, sizeof(dcb), 0);
+	dcb->DCBlength = sizeof(dcb);
+	dcb->BaudRate = baud;
+	dcb->fBinary = true;
+	dcb->fParity = false;
+	dcb->fOutxCtsFlow = false;
+	dcb->fOutxDsrFlow = false;
+	dcb->fDtrControl = DTR_CONTROL_ENABLE;
+	dcb->fDsrSensitivity = false;
+	dcb->fTXContinueOnXoff = true;
+	dcb->fOutX = false;
+	dcb->fInX = false;
+	dcb->fErrorChar = false;
+	dcb->fNull = false;
+	dcb->fRtsControl = RTS_CONTROL_ENABLE;
+	dcb->fAbortOnError = true;
+	dcb->XonLim = 0;
+	dcb->XoffLim = 0;
+	dcb->ByteSize = 8;
+	dcb->Parity = NOPARITY;
+	dcb->StopBits = ONESTOPBIT;
+	dcb->XonChar = 0;
+	dcb->XoffChar = 0;
+	dcb->ErrorChar = 0;
+	dcb->EofChar = 0;
+	dcb->EvtChar = 0;
+
+	if (!SetCommState(Handle, dcb))
+		status = SysError("Unable to set the comm state\n");
+
+	COMMTIMEOUTS CommTimeouts;
+	FillMemory(&CommTimeouts, sizeof(CommTimeouts), 0);
+	CommTimeouts.ReadIntervalTimeout = 0;
+	CommTimeouts.ReadTotalTimeoutConstant = 2000;
+	if (!SetCommTimeouts(Handle, &CommTimeouts))
+		status = SysError("Unable to set timeouts\n");
+
+	if (status != OK)
+		Close();
+
+	ClearErrors();
+
+	return status;
+}
+
+void Rs232::Close()
+{
+	CloseHandle(Handle);
+	Handle = INVALID_HANDLE_VALUE;
+}
+
+	
+bool Rs232::Read(byte* buf, size_t count, size_t& actual)
+{
+	DWORD dwRead;
+	debug(9, "Rs232::Read: count=%d\n", count);
+	if (!ReadFile(Handle, buf, count, &dwRead, NULL)) {
+        ClearErrors();
+		return SysError("Couldn't read bytes\n");
+	}
+    actual = dwRead;
+
+	if (actual == 0) return Error("Rs232 Timed out while reading.\n");
+
+    debug(9, "Read:  count=%d actual=%d  buf=", count, actual);
+	for (DWORD i=0; i<dwRead; i++)
+		debug(9,"%02x(%c) ", buf[i], buf[i]);
+	debug(9, "\n");
+
+	return OK;
+}
+
+
+
+bool Rs232::Write(const byte* buf, size_t len)
+{
+	debug(9, "Write: len=%d  buf=", len);
+	for (size_t i = 0; i < len; i++)
+		debug(9," %02x(%c) ", buf[i], buf[i]);
+	debug(9, "\n");
+
+	DWORD actual;
+	if (WriteFile(Handle, buf, len, &actual, NULL) == 0 || len != actual)
+		return SysError("Unable to write to com port\n");
+	return OK;
+}
+
+
+
+bool Rs232::SetBaud(int baud)
+{
+	debug("SetBaud: baud=%d\n", baud);
+
+    // Get the current configuration
+	DCB dcb[1];
+	if (GetCommState(Handle, dcb) == 0)
+		return SysError("SetBaud is unable to get current port configuration\n");
+
+	// Change the baud rate. Do a purge to avoid framing errors in the input buffer.
+	//  (If we're changing baud rate, then we're likely have framing errors)
+	Purge();
+	dcb->BaudRate = baud;
+	if (SetCommState(Handle, dcb) == 0)
+		return SysError("Unable to set baud rate to %d baud\n", baud);
+	Purge();
+
+	return OK;
+}
+
+
+bool Rs232::GetBaud(int& baud)
+{
+    // Get the current configuration
+	DCB dcb[1];
+
+	if (GetCommState(Handle, dcb) == 0)
+		return SysError("Unable to get current baud rate of port\n");
+	baud = dcb->BaudRate;
+
+	debug("GetBaud - baud=%d\n", baud);
+	return OK;
+}
+
+
+bool Rs232::SetFraming(int32 DataBits, int32 Parity, int32 StopBits)
+{
+	debug("SetFraming: DataBits=%d Parity=%d StopBits=%d\n",
+		               DataBits, Parity, StopBits);
+
+    // Get the current configuration
+	DCB dcb[1];
+
+	if (GetCommState(Handle, dcb) == 0)
+		return SysError("Unable to get current config of port\n");
+
+	if (DataBits == 7)      dcb->ByteSize = 7;
+	else if (DataBits == 8) dcb->ByteSize = 8;
+	else if (DataBits == -1)                 ;
+	else return Error("Attempting to configure invalid nr of Data bits\n");
+
+	if (Parity == 0)      dcb->Parity = NOPARITY;
+	else if (Parity == 1) dcb->Parity = ODDPARITY;
+	else if (Parity == 2) dcb->Parity = EVENPARITY;
+	else if (Parity == -1)                        ;
+	else return Error("Attempting to set invalid parity\n");
+
+	if (StopBits == 1)      dcb->StopBits = ONESTOPBIT;
+	else if (StopBits == 2) dcb->StopBits = TWOSTOPBITS;
+	else if (StopBits == -1)                           ;
+	else return Error("Attempting to set invalid stopbits\n");
+		
+    // Set the new configuration
+	if (SetCommState(Handle, dcb) == 0)
+		return SysError("Unable to configure Rs232 framing\n");
+
+	return OK;
+}
+
+
+static COMMTIMEOUTS timeout = {0};
+bool Rs232::SetTimeout(int msec)
+{
+	timeout.ReadTotalTimeoutConstant = msec;
+	if (SetCommTimeouts(Handle, &timeout) == 0)
+		return Error();
+
+	return OK;
+}
+
+
+
+bool Rs232::GetTimeout(int& msec)
+{
+	if (GetCommTimeouts(Handle, &timeout) == 0)
+		return Error();
+	msec = timeout.ReadTotalTimeoutConstant;
+	return OK;
+}
+
+bool Rs232::Purge()
+{
+	// Getting a complete purge of the input buffer is essential
+	//  to recovering from errors and changing the baud rate.
+	debug(5, "Rs232::Purge\n");
+	Sleep(100); // Let in-transit characters do their thing
+	DWORD Errors;
+	ClearCommError(Handle, &Errors, NULL);
+	PurgeComm(Handle, PURGE_RXCLEAR|PURGE_RXABORT);
+	ClearCommError(Handle, &Errors, NULL);
+
+	// Some USB-RS232 adapters don't clear their remote buffers.
+	// Consequently, we may still have bad characters sitting in
+	// the remote input buffer. The bad bytes usually show up as a 
+	// Windows 995 error. Do some extra reading to get rid of them.
+	
+	// Set a short time out
+	int timeout;
+	if (GetTimeout(timeout)) return Error();
+	if (SetTimeout(10) != OK) return Error();
+
+	// repeat until the buffers are empty 
+	bool ErrCode;
+	for (int i=0; i<100; i++) {
+	
+		// Read a buffer. If partial buffer, done
+		byte buffer[1]; size_t actual;
+		ErrCode = Read(buffer, sizeof(buffer), actual);
+		if (ErrCode == OK && actual != sizeof(buffer)) break;
+
+        // 995 and ??? errors are OK. They mean we are clearing out bad bytes
+		if (ErrCode != OK)
+			if (GetLastError() == 995) ClearCommError(Handle, &Errors, NULL);
+			else break;
+	}
+
+	if (ErrCode != OK) ClearCommError(Handle, &Errors, NULL);
+	if (SetTimeout(timeout) != OK) return Error();
+	return OK;
+}
+
+int Rs232::FindBaudRate(const char* query, const char* response, int* BaudRates)
+{
+    // Save the current timeout
+	int timeout;
+	if (GetTimeout(timeout) != OK) return 0;
+
+    // Set the Timeout to 2 seconds  
+	if (SetTimeout(2000) != OK) return 0;
+
+	// Query the current baud rate
+	int baud;
+	if (GetBaud(baud) != OK) return 0;
+
+	// If the current baud is reasonable, try at the current baud rate 
+	if (baud >= 9600 && QueryResponse(query, response, 1000) == OK) goto done;
+
+	// repeat for each baud rate until success
+	int i;
+	for (i=0; BaudRates[i] > 0; i++) {
+
+		// We're starting clean with respect to errors (don't want to accumulate)
+		ClearError();
+
+		// Set the baud rate, and query the device.
+		if (BaudRates[i] != baud 
+			&& this->SetBaud(BaudRates[i]) == OK
+			&& QueryResponse(query, response, 1000) == OK) 
+			break;
+	}
+	baud = BaudRates[i];
+
+done:
+	// Restore the original timeout value
+	if (SetTimeout(timeout) != OK) return Error();
+
+	// Return the baud rate we found, zero if none.
+	return baud;
+}
+
+   
+void Rs232::ClearErrors()
+{
+	DWORD Errors;
+	ClearCommError(Handle, &Errors, NULL);
+}
+

@@ -1,0 +1,11 @@
+URL: http://kinematic.googlecode.com/svn/trunk
+Relative URL: ^/trunk
+Repository Root: http://kinematic.googlecode.com/svn
+Repository UUID: f08f6b7a-393f-11de-b310-9106b1f7c239
+Revision: 41
+Node Kind: directory
+Schedule: normal
+Last Changed Author: google@coyotebush.net
+Last Changed Rev: 41
+Last Changed Date: 2011-01-15 20:29:25 +0300 (Сб, 15 янв 2011)
+
